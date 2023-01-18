@@ -37,7 +37,7 @@ page内存储records有两种类型：
 
 在page中存储操作日志，根据日志重新构建数据。此结构的兴起源于当前某些系统是append-only的，适合此种文件格式。
 
-# Buffer Pool Manager
+# Buffer Pool
 
 ## 目标
 
@@ -108,7 +108,9 @@ buffer pool是数据库系统向OS申请的一块内存空间，数据库系统�
 
 ### LRU
 
-最近最久未使用，如果每次找最久未使用的页面对于性能的开销是很大的。
+LRU 算法的设计原则是：如果一个数据在最近一段时间没有被访问到，那么在将来它被访问的可能性也很小。也就是说，当限定的空间已存满数据时，应当把最久没有被访问到的数据淘汰。
+
+如果每次找最久未使用的页面对于性能的开销是很大的。
 
 ### CLOCK
 
@@ -126,4 +128,105 @@ buffer pool是数据库系统向OS申请的一块内存空间，数据库系统�
 LRU-K Replacer 用于存储 buffer pool 中 page 被引用的记录，并根据引用记录来选出在 buffer pool 满时需要被驱逐的 page。
 
 在**普通的 LRU** 中，我们**仅需记录 page 最近一次被引用的时间**，在驱逐时，**选择最近一次引用时间最早**的 page。
+
+LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核心思想是将“最近使用过1次”的判断标准扩展为“最近使用过K次”。
+
+相比LRU，LRU-K 需要多维护一个队列，用于记录所有缓存数据被访问的历史。只有当数据的访问次数达到k次的时候，才将数据放入缓存。当需要淘汰数据时，LRU-K会淘汰第K次访问时间距当前时间最大的数据。
+
+<img src="https://upload-images.jianshu.io/upload_images/2099201-a41c570dcac9fcad.png?imageMogr2/auto-orient/strip|imageView2/2/w/481/format/webp" alt="img" style="zoom:80%;" />
+
+在 LRU-K 中，我们需要记录 page 最近 K 次被引用的时间。假如 list 中所有 page 都被引用了大于等于 K 次，则比较最近第 K 次被引用的时间，驱逐最早的。假如 list 中存在引用次数少于 K 次的 page，则将这些 page 挑选出来，用普通的 LRU 来比较这些 page 第一次被引用的时间，驱逐最早的。
+
+另外还需要注意一点，LRU-K Replacer 中的 page 有一个 evictable 属性，当一个 page 的 evicitable 为 false 时，上述算法跳过此 page 即可。这里主要是为了上层调用者可以 pin 住一个 page，对其进行一些读写操作，此时需要保证 page 驻留在内存中。
+
+#### LRU-K Replacer Implementation
+
+
+
+### LOCALIZATION
+
+数据库系统根据每一个query或者事务的统计信息，在buffer pool中淘汰选择的page。
+
+### PRIORITY HINTS
+
+给page分配优先级，置换时考虑优先级。
+
+## InnoDB 的具体解决方法
+
+<img src="StudyNotes.assets/image-20230118165148487.png" alt="image-20230118165148487" style="zoom:50%;" />
+
+由上图可以看出 InnoDB 将 LRU List 分为两部分，默认前 5/8 为 New Sublist（新生代）用于存储经常被使用的热点数据页，后 3/8 为 Old Sublist（老生代），新读入的数据页默认被放到 Old Sublist 中，只有满足一定条件后，才会被移入 New Sublist。
+
+新生代和老生代代比例在 MySQL 中通过参数 `innodb_old_blocks_pct` 控制，值的范围是5到95.默认值是37（即池的3/8）。
+
+- 如果数据页真正被读取（预读成功），才会加入到新生代的头部
+- 如果数据页没有被读取，则会比新生代里的“热数据页”更早被淘汰出缓冲池
+
+改进版缓冲池LRU能够很好的解决“预读失败”的问题。但仍然无法解决缓冲池被污染但问题。
+
+**解决方法**
+
+缓冲池加入了一个“老生代停留时间窗口”的机制：
+
+(a). 假设T=老生代停留时间窗口
+
+(b). 插入老生代头部的页，即使立刻被访问，并不会立刻放入新生代头部
+
+(c). 只有满足“被访问”并且“在老生代停留时间”大于T，才会被放入新生代头部
+
+## Dirty Pages处理
+
+在淘汰一个page时，如果一个page不是dirty page，则可以直接将此page从内存中移除，因为此page在内存中和disk中是一致的。如果此page是dirty page就需要将此page的数据更新到磁盘中。此时有两种解决方法：
+
+1. 置换时写出。性能肯定很差，因为系统要等待磁盘IO完成
+2. 后台写出。使用一个后台线程来周期性将dirtypage更新到磁盘上。需要注意dirty page写出时必须保证日志已经更新。
+
+# 用于检索的数据结构
+
+## Hash Table
+
+哈希表即将数据key通过哈希函数映射到一个特定array的offset上。Hash Table的设计包含两个部分：
+
+1. hash function
+2. hash schema
+
+### 哈希函数
+
+常用的hash库有：
+
+- CRC-64 (1975)
+- MurmurHash (2008)
+- Google CityHash (2011)
+- Facebook XXHash (2012)
+- Google FarmHash (2014)
+
+### 静态Hash Table
+
+静态意味hash表的大小是固定的，不会动态的resize。其需要对所存储的数据量有一个大致的假设。常用的静态Hash schema有：
+
+1. Linear Probe Hashing，当hash冲突时，就顺序向下探测空位置插入
+2. Robin Hood Hashing，在linear probe的基础上，对每一个entry维护一个距离其原始hash值的offset。steal space的思想
+3. Cuckoo Hashing，使用两个hash table，每个使用不同的hash函数，当有hash冲突时，依次移动，寻找空位。
+
+解决非唯一键值的方法：
+
+1. 分割的linked list，即hash表中的存储的value是一个linked list的起始，所有相同键值的存储早这个linked list中
+2. 直接在hash table中存储重复的键值
+
+### 动态Hash Table
+
+区别于静态Hash Table，动态Hash Table机制中，不需要对存储的数据量有评估，动态Hash Table会根据存储的数据量大小，动态的扩容/缩容。三种经典的动态Hash Table模式：
+
+1. Chained Hashing，hash的结果是bucket的编号，每个bucket是一个linked list。
+2. Extendible Hashing，对chained hashing中的bucket进行reshuffling，多个slot可以指向同一个bucket
+
+### Extendible Hash Table
+
+
+
+#### Extendible Hash Table Implementation
+
+
+
+## Tree Indixes
 
