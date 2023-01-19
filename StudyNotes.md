@@ -141,6 +141,8 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 
 #### LRU-K Replacer Implementation
 
+每个元素都需要一个标记`evictable`来判断元素是否可以被驱逐，如果为`false`，则代表元素无法被驱逐。因此我们需要设计一个结构`FrameEntry`来记录这类信息。
+
 
 
 ### LOCALIZATION
@@ -181,6 +183,35 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 1. 置换时写出。性能肯定很差，因为系统要等待磁盘IO完成
 2. 后台写出。使用一个后台线程来周期性将dirtypage更新到磁盘上。需要注意dirty page写出时必须保证日志已经更新。
 
+## Buffer Pool Manager Implementation
+
+`BufferPoolManager`负责从`DiskManager`获取数据库页面并将它们存储在内存中。`BufferPoolManage`还可以在有要求它这样做时，或者当它需要驱逐一个页以便为新页腾出空间时，将脏页写入磁盘。为了确保您的实现能够正确地与系统的其余部分一起工作，我们将为您提供一些已经填写好的功能。您也不需要实现实际读写数据到磁盘的代码(在我们的实现中称为`DiskManager`)。我们将为您提供这一功能。
+
+系统中的所有内存页面均由`Page`对象表示。`BufferPoolManager`不需要了解这些页面的内容。 但是，作为系统开发人员，重要的是要了解`Page`对象只是缓冲池中用于存储内存的容器，因此并不特定于唯一页面。 也就是说，每个`Page`对象都包含一块内存，`DiskManager`会将其用作复制从磁盘读取的物理页面内容的位置。 `BufferPoolManager`将在将其来回移动到磁盘时重用相同的Page对象来存储数据。 这意味着在系统的整个生命周期中，相同的`Page`对象可能包含不同的物理页面。`Page`对象的标识符（`page_id`）跟踪其包含的物理页面。 如果`Page`对象不包含物理页面，则必须将其`page_id`设置为`INVALID_PAGE_ID`。
+
+每个Page对象还维护一个计数器，以显示“固定”该页面的线程数。`BufferPoolManager`不允许释放固定的页面。每个`Page`对象还跟踪它的脏标记。您的工作是判断页面在解绑定之前是否已经被修改（修改则把脏标记置为1）。`BufferPoolManager`必须将脏页的内容写回磁盘，然后才能重用该对象。
+
+`BufferPoolManager`实现将使用在此分配的前面步骤中创建的`LRUReplacer`类。它将使用`LRUReplacer`来跟踪何时访问页对象，以便在必须释放一个帧以为从磁盘复制新的物理页腾出空间时，它可以决定取消哪个页对象
+
+你需要实现在(`src/buffer/buffer_pool_manager.cpp`):的以下函数
+
+- `FetchPageImpl(page_id)`
+- `NewPageImpl(page_id)`
+- `UnpinPageImpl(page_id, is_dirty)`
+- `FlushPageImpl(page_id)`
+- `DeletePageImpl(page_id)`
+- `FlushAllPagesImpl()`
+
+Buffer Pool Manager 里有几个重要的成员：
+
+- pages：buffer pool 中缓存 pages 的指针数组
+- disk_manager：框架提供，可以用来读取 disk 上指定 page id 的 page 数据，或者向 disk 上给定 page id 对应的 page 里写入数据
+- page_table：刚才实现的 Extendible Hash Table，用来将 page id 映射到 frame id，即 page 在 buffer pool 中的位置
+- replacer：刚才实现的 LRU-K Replacer，在需要驱逐 page 腾出空间时，告诉我们应该驱逐哪个 page
+- free_list：空闲的 frame 列表
+
+
+
 # 用于检索的数据结构
 
 ## Hash Table
@@ -205,7 +236,7 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 静态意味hash表的大小是固定的，不会动态的resize。其需要对所存储的数据量有一个大致的假设。常用的静态Hash schema有：
 
 1. Linear Probe Hashing，当hash冲突时，就顺序向下探测空位置插入
-2. Robin Hood Hashing，在linear probe的基础上，对每一个entry维护一个距离其原始hash值的offset。steal space的思想
+2. Robin Hood Hashing，在linear probe的基础上，对每一个entry维护一个距离其原始hash值的offset。steal space的思想。
 3. Cuckoo Hashing，使用两个hash table，每个使用不同的hash函数，当有hash冲突时，依次移动，寻找空位。
 
 解决非唯一键值的方法：
@@ -218,15 +249,133 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 区别于静态Hash Table，动态Hash Table机制中，不需要对存储的数据量有评估，动态Hash Table会根据存储的数据量大小，动态的扩容/缩容。三种经典的动态Hash Table模式：
 
 1. Chained Hashing，hash的结果是bucket的编号，每个bucket是一个linked list。
+
+   <img src="StudyNotes.assets/image-20230119001331728.png" alt="image-20230119001331728" style="zoom:50%;" />
+
 2. Extendible Hashing，对chained hashing中的bucket进行reshuffling，多个slot可以指向同一个bucket
+
+<img src="StudyNotes.assets/image-20230119003057514.png" alt="image-20230119003057514" style="zoom:50%;" />
+
+> 当 global 为 2时，bucket满了，则需要修改 global 为 3，进行reshuffling
+
+<img src="StudyNotes.assets/image-20230119003157403.png" alt="image-20230119003157403" style="zoom:50%;" />
+
+3. Linear Hashing，维护一个指针指向下一个将要 spilt 的bucket。
+
+<img src="StudyNotes.assets/image-20230119131232446.png" alt="image-20230119131232446" style="zoom:50%;" />
 
 ### Extendible Hash Table
 
+这个哈希表在 Buffer Pool Manager 中主要用来存储 buffer pool 中 page id 和 frame id 的映射关系。
 
+Extendible Hash Table 由一个 directory 和多个 bucket 组成。
+
+- **directory**: 存放指向 bucket 的指针，是一个数组。用于寻找 key 对应 value 所在的 bucket。
+- **bucket**: 存放 value，是一个链表。一个 bucket 可以至多存放指定数量的 value。
+
+Extendible Hash Table 与 Chained Hash Table 最大的区别是，Extendible Hash 中，不同的指针可以指向同一个 bucket，而 Chained Hash 中每个指针对应一个 bucket。
+
+发生冲突时，Chained Hash 简单地将新的 value 追加到其 key 对应 bucket 链表的最后，也就是说 Chained Hash 的 bucket 没有容量上限。而 Extendible Hash 中，如果 bucket 到达容量上限，则对桶会进行一次 split 操作。
+
+#### 样例
+
+设定，桶大小为3 (假设)。
+
+哈希函数：假设全局深度是 X，那么哈希函数返回 X 的最低位。
+
+* **首先初始化**，全局深度 global-depth 和 local-depth 总是为1。
+
+<img src="StudyNotes.assets/image-20230119150348414.png" alt="image-20230119150348414" style="zoom:50%;" />
+
+* **插入 16**，其二进制形式是 10000，且全局深度是1。哈希函数返回1000**0**最低1位为0。因此，16映射到目录的`id=0`。
+
+<img src="StudyNotes.assets/image-20230119150535608.png" alt="image-20230119150535608" style="zoom:50%;" />
+
+* **插入4和6**：4（10**0**）和 6 (11**0**)的最低位都是0。因此，它们的哈希结果如下：
+
+<img src="StudyNotes.assets/image-20230119150658997.png" alt="image-20230119150658997" style="zoom:50%;" />
+
+* **插入22**：其二进制形式是1011**0**。它的最低位是0。目录0指向的桶已经满了，发生了移除。
+
+<img src="StudyNotes.assets/image-20230119151420739.png" alt="image-20230119151420739" style="zoom:50%;" />
+
+溢出时我们需要根据如下过程：
+
+<img src="StudyNotes.assets/image-20230119151508317.png" alt="image-20230119151508317" style="zoom:50%;" />
+
+* 由于局部深度=全局深度，因此我们执行 bucket split 和 directory expansion。同时，分裂之后再溢出的桶中重新哈希数值。并且因为全局深度增加1，所以全局深度也是2。因此16,4,6,22倍重新哈希为最低2位。[16(100**00**), 4(1**00**), 6(1**10**), 22(101**10**)]
+
+<img src="StudyNotes.assets/image-20230119152120529.png" alt="image-20230119152120529" style="zoom:50%;" />
+
+> 注意，未溢出的桶扔没有触及。但是因为目录的数量已经翻倍，现在又2个目录01和11指向了同一个桶。这是因为桶的局部深度保持为1。并且任何局部深度小于全局深度的桶会被不止一个目录指向。
+
+* **插入24和10**：24（110**00**）和 10（10**10**）基于目录 id 00 和 10 可以被哈希。此处，没有遇到溢出的情况。
+
+  <img src="StudyNotes.assets/image-20230119152423771.png" alt="image-20230119152423771" style="zoom:50%;" />
+
+* **插入20**：元素20（101**00**）时再一次遇到溢出问题。
+
+  <img src="StudyNotes.assets/image-20230119152536236.png" alt="image-20230119152536236" style="zoom:50%;" />
+
+  发生桶分裂和目录扩张。
+
+  <img src="StudyNotes.assets/image-20230119152612548.png" alt="image-20230119152612548" style="zoom:50%;" />
+
+* **插入26**
+
+  <img src="StudyNotes.assets/image-20230119152819253.png" alt="image-20230119152819253" style="zoom:50%;" />
+
+  由于局部深度小于全局深度（2 < 3），目录不会翻倍，仅仅进行桶分裂和分裂的桶元素重新哈希。最后，哈希给定数值列表的结果已经获得。
+
+最后，这11个元素插入成功完成。
 
 #### Extendible Hash Table Implementation
 
+Extendible Hash Table 是要保证线程安全的。实际上应该是整个 table 一把大锁，再分区加多把小锁，或者更简单的做法，每个 bucket 一把小锁。均使用读写锁。
 
+对于每个 bucket，在 Find 时上读锁，Insert 和 Remove 时上写锁。
+
+对于整张表，Find 和 Remove 时上读锁。Find 上读锁好理解，而 Remove 实际上只会改变 bucket 的内部变量，其线程安全由 bucket 内部锁保证，因此也可以只上读锁。Insert 在无需 split 时也可以仅上读锁，需要 split 时上写锁。
 
 ## Tree Indixes
+
+数据库常用的树索引结构是B+ tree，是B-tree族中的一个，其余的还有：
+
+- B-tree
+- B*tree
+- Blink tree(Paper: Efficient Locking for Concurrent Operations on B-Trees)
+
+B+tree是一个M路的平衡树，是一种针对大block数据IO系统的优化方式，其搜索、序列访问、插入和删除的代价都是O(logn). B+tree中的每个节点除了root节点都是至少半满的（ [M/2-1, M-1] ）,每个内部节点有k个key以及k+1个非null的子节点。
+
+# 索引并发控制
+
+多线程的数据安全、正确主要有两个部分：
+
+1. 逻辑数据正确性：事务、线程视角的获取的数据应该是按照数据库隔离级别正确获取的数据。常使用锁概念来保证
+2. 物理数据正确性：实际在操作内存、磁盘数据时的安全一致操作，常使用latch概念来保证
+
+Lock用于隔离不同的事务，保护逻辑上的数据库数据。类型有共享锁、互斥锁、Update、意向锁。有专门的锁管理器，其会进行死锁检测和死锁恢复，常用的手段有waits-for、timeout、abort。
+
+Latch用于隔离线程间对内存数据的访问。只有两种类型的latch：read latch于write latch。latch没有死锁检测和死锁恢复模块，依靠编程人员的规范性来避免死锁。
+
+Latch的实现方式：
+
+1. mutex
+2. Test-and-Set Spin Latch，需要现代CPU支持
+3. Read-Writer Latch, 需要良好实现的队列管理
+
+### Hash Table Latch
+
+hash table操作都是一个方向的操作（hash->寻址->操作），因此是不会出现死锁的。
+ 锁的粒度有：
+
+1. page粒度的latch
+2. slot粒度的latch
+
+### B+Tree Latch
+
+B+树主要解决两个问题：
+
+1. 并发的多线程访问
+2. 保证一个线程来叶节点时，其余现在在merge/split时的安全性
 
