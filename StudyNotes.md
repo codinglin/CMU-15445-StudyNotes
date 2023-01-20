@@ -143,7 +143,7 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 
 每个元素都需要一个标记`evictable`来判断元素是否可以被驱逐，如果为`false`，则代表元素无法被驱逐。因此我们需要设计一个结构`FrameEntry`来记录这类信息。
 
-
+设计一个List作为`访问数据小于K`的`FrameEntry`存储，设计一个另一个List作为`访问数据大于等于K`的`FrameEntry`存储，再使用一个Map，key为`frame_id`，value为`FrameEntry`的指针地址。类似与LRU的实现思路，去实现LRU-K。
 
 ### LOCALIZATION
 
