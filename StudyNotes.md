@@ -191,7 +191,7 @@ LRU-K的主要目的是为了解决LRU算法“缓存污染”的问题，其核
 
 每个Page对象还维护一个计数器，以显示“固定”该页面的线程数。`BufferPoolManager`不允许释放固定的页面。每个`Page`对象还跟踪它的脏标记。您的工作是判断页面在解绑定之前是否已经被修改（修改则把脏标记置为1）。`BufferPoolManager`必须将脏页的内容写回磁盘，然后才能重用该对象。
 
-`BufferPoolManager`实现将使用在此分配的前面步骤中创建的`LRUReplacer`类。它将使用`LRUReplacer`来跟踪何时访问页对象，以便在必须释放一个帧以为从磁盘复制新的物理页腾出空间时，它可以决定取消哪个页对象
+`BufferPoolManager`实现将使用在此分配的前面步骤中创建的`LRUKReplacer`类。它将使用`LRUReplacer`来跟踪何时访问页对象，以便在必须释放一个帧以为从磁盘复制新的物理页腾出空间时，它可以决定取消哪个页对象
 
 你需要实现在(`src/buffer/buffer_pool_manager.cpp`):的以下函数
 
@@ -209,8 +209,6 @@ Buffer Pool Manager 里有几个重要的成员：
 - page_table：刚才实现的 Extendible Hash Table，用来将 page id 映射到 frame id，即 page 在 buffer pool 中的位置
 - replacer：刚才实现的 LRU-K Replacer，在需要驱逐 page 腾出空间时，告诉我们应该驱逐哪个 page
 - free_list：空闲的 frame 列表
-
-
 
 # 用于检索的数据结构
 
@@ -333,10 +331,6 @@ Extendible Hash Table 与 Chained Hash Table 最大的区别是，Extendible Has
 
 Extendible Hash Table 是要保证线程安全的。实际上应该是整个 table 一把大锁，再分区加多把小锁，或者更简单的做法，每个 bucket 一把小锁。均使用读写锁。
 
-对于每个 bucket，在 Find 时上读锁，Insert 和 Remove 时上写锁。
-
-对于整张表，Find 和 Remove 时上读锁。Find 上读锁好理解，而 Remove 实际上只会改变 bucket 的内部变量，其线程安全由 bucket 内部锁保证，因此也可以只上读锁。Insert 在无需 split 时也可以仅上读锁，需要 split 时上写锁。
-
 ## Tree Indixes
 
 数据库常用的树索引结构是B+ tree，是B-tree族中的一个，其余的还有：
@@ -378,4 +372,23 @@ B+树主要解决两个问题：
 
 1. 并发的多线程访问
 2. 保证一个线程来叶节点时，其余现在在merge/split时的安全性
+
+# 排序和聚集
+
+## 查询计划
+
+在树中这个操作被重排（优化器）
+
+<img src="StudyNotes.assets/image-20230121000734156.png" alt="image-20230121000734156" style="zoom:33%;" />
+
+## EXTERNAL MERGE SORT
+
+<img src="StudyNotes.assets/image-20230121161749134.png" alt="image-20230121161749134" style="zoom:50%;" />
+
+## AGGREGATIONS
+
+两种实现选择：
+
+* Sorting
+* Hashing
 
